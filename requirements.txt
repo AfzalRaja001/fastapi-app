@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+numpy
+pandas
+scikit-learn==1.6.1
+pydantic
+python-multipart
+category-encoders
+xgboost
+requests
