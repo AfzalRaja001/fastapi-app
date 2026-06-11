@@ -1,4 +1,5 @@
 import os
+import json
 import pickle
 import numpy as np
 import pandas as pd
@@ -6,6 +7,7 @@ from functools import lru_cache
 from typing import List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -18,25 +20,25 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.environ.get("MODELS_DIR", os.path.join(base_dir, "models"))
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 
-# Leave API_KEY unset (empty string) to keep the current open behaviour.
-# Set it in Render env vars to enable key enforcement.
+# Auth: leave empty to keep current open behaviour; set in Render env to enforce.
 API_KEY = os.environ.get("API_KEY", "")
 
+# Database: leave empty to load from local pkl files (current behaviour).
+# Set to a Neon/Postgres connection string to serve data from the DB instead.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 # ── Rate limiter (in-memory, per-IP) ─────────────────────────────────────────
-# No Redis needed: a single Render instance shares one process.
 limiter = Limiter(key_func=get_remote_address)
 
 # ── API-key auth (optional) ──────────────────────────────────────────────────
-# auto_error=False so a missing header returns None instead of a 422 error —
-# we handle the None case ourselves inside require_api_key.
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def require_api_key(key: str = Depends(_api_key_header)):
-    """Enforce X-API-Key header when API_KEY env var is set. No-op otherwise."""
+    """Enforce X-API-Key header only when API_KEY env var is set."""
     if API_KEY and key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# ── ML artifacts (loaded at startup) ─────────────────────────────────────────
+# ── Globals (populated in lifespan) ──────────────────────────────────────────
 pipeline = None
 input_X = None
 cosine_sim1 = None
@@ -44,18 +46,21 @@ cosine_sim2 = None
 cosine_sim3 = None
 location_df = None
 property_names: List[str] = []
+viz_df = None       # analytics data – loaded from DB when DATABASE_URL is set
+db_engine = None    # SQLAlchemy engine, reused across requests
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipeline, input_X, cosine_sim1, cosine_sim2, cosine_sim3, location_df, property_names
+    global pipeline, input_X, cosine_sim1, cosine_sim2, cosine_sim3
+    global location_df, property_names, viz_df, db_engine
 
     print(f"Loading models from: {MODELS_DIR}")
 
     try:
+        # ── ML artifacts: always loaded from pkl files ────────────────────────
+        # These stay in the image until Phase 3 (Cloudflare R2) moves them out.
         with open(os.path.join(MODELS_DIR, "final_xgb_pipeline.pkl"), "rb") as f:
             pipeline = pickle.load(f)
-        with open(os.path.join(MODELS_DIR, "input_data_X.pkl"), "rb") as f:
-            input_X = pickle.load(f)
 
         with open(os.path.join(MODELS_DIR, "cosine_sim1.pkl"), "rb") as f:
             cosine_sim1 = pickle.load(f)
@@ -71,15 +76,36 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Cosine matrices and location_df index size must match.")
 
         property_names = location_df.index.tolist()
-        print(f"✅ Loaded {len(property_names)} properties")
-        print("✅ Models loaded successfully!")
+        print(f"✅ Loaded {len(property_names)} properties from pkl")
+
+        # ── Property data: Postgres when DATABASE_URL is set, pkl otherwise ──
+        if DATABASE_URL:
+            from sqlalchemy import create_engine as _create_engine
+            # pool_pre_ping keeps connections alive on Neon's serverless backend
+            db_engine = _create_engine(
+                DATABASE_URL,
+                pool_size=5,
+                max_overflow=2,
+                pool_pre_ping=True,
+            )
+            input_X = pd.read_sql("SELECT * FROM property_features", db_engine)
+            viz_df = pd.read_sql("SELECT * FROM properties_viz", db_engine)
+            print(f"✅ Loaded {len(input_X)} feature rows and {len(viz_df)} viz rows from PostgreSQL")
+        else:
+            with open(os.path.join(MODELS_DIR, "input_data_X.pkl"), "rb") as f:
+                input_X = pickle.load(f)
+            print("✅ Loaded input features from local pkl (DATABASE_URL not set)")
+
+        print("✅ Startup complete")
     except Exception as e:
-        print(f"❌ Error loading models: {e}")
+        print(f"❌ Startup failed: {e}")
         raise
 
     yield
 
     print("Shutting down...")
+    if db_engine:
+        db_engine.dispose()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Real Estate API", lifespan=lifespan)
@@ -140,8 +166,7 @@ class LocationSearchResponse(BaseModel):
     items: List[LocationSearchItem]
     count: int
 
-# ── Open endpoints (no auth, no rate limit) ───────────────────────────────────
-# /healthz must stay open: Render uses it for health checks.
+# ── Open endpoints (no auth required) ────────────────────────────────────────
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -155,11 +180,12 @@ def root():
             "predict_price": "/predict-price (POST)",
             "recommend": "/recommend (POST)",
             "properties": "/properties (GET)",
-            "sectors": "/sectors (GET)"
+            "sectors": "/sectors (GET)",
+            "analytics_data": "/analytics/data (GET)"
         }
     }
 
-# ── Protected – cheap data lookups (auth only, no per-endpoint rate limit) ────
+# ── Protected – cheap data lookups ───────────────────────────────────────────
 @app.get("/properties", dependencies=[Depends(require_api_key)])
 def get_properties():
     if property_names:
@@ -200,10 +226,24 @@ def get_locations():
         return {"locations": locations, "count": len(locations)}
     return {"locations": [], "count": 0}
 
-# ── Protected – compute endpoints (auth + per-endpoint rate limits) ────────────
-# slowapi requires `request: Request` as the first parameter on rate-limited
-# endpoints so it can extract the client IP. The API contract is unchanged.
+# ── Analytics data (served from DB when available) ────────────────────────────
+@app.get("/analytics/data", dependencies=[Depends(require_api_key)])
+def get_analytics_data():
+    """
+    Returns the full visualization dataset for the analytics dashboard.
+    Only available when DATABASE_URL is configured; returns 503 otherwise
+    so the frontend gracefully falls back to its bundled CSV.
+    """
+    if viz_df is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analytics data not available — DATABASE_URL is not configured"
+        )
+    # Use pandas JSON serialiser so NaN becomes null (valid JSON) rather than
+    # the bare NaN literal that Python's json module would produce.
+    return JSONResponse(content=json.loads(viz_df.to_json(orient="records")))
 
+# ── Protected – compute endpoints (auth + rate limits) ───────────────────────
 @app.post("/predict-price", response_model=PriceResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit("10/minute")
 def predict_price(request: Request, req: PriceRequest):
@@ -244,7 +284,6 @@ def _cached_recommend(pname: str, top_n: int, w1: float, w2: float, w3: float):
 
     combo = w1 * cosine_sim1 + w2 * cosine_sim2 + w3 * cosine_sim3
     sims = combo[idx]
-
     order = np.argsort(-sims)
     top = [i for i in order if i != idx][:top_n]
     return [
