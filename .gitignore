@@ -7,3 +7,12 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# ML artifacts now stored in Cloudflare R2 — keep locally for dev fallback
+# but do not commit to git (prevents accidental re-inclusion in the image)
+models/final_xgb_pipeline.pkl
+models/cosine_sim1.pkl
+models/cosine_sim2.pkl
+models/cosine_sim3.pkl
+models/location_distance.pkl
+models/feature_text.pkl

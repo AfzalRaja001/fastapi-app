@@ -4,3 +4,15 @@ __pycache__
 .git
 .gitignore
 *.pyc
+
+# ML artifacts served from Cloudflare R2 at runtime — exclude from image
+models/final_xgb_pipeline.pkl
+models/cosine_sim1.pkl
+models/cosine_sim2.pkl
+models/cosine_sim3.pkl
+models/location_distance.pkl
+models/feature_text.pkl
+
+# Dev/ops scripts not needed at runtime
+migrate_to_db.py
+upload_models_to_r2.py
