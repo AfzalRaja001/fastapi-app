@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import pickle
@@ -15,7 +16,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# Config 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.environ.get("MODELS_DIR", os.path.join(base_dir, "models"))
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
@@ -27,10 +28,17 @@ API_KEY = os.environ.get("API_KEY", "")
 # Set to a Neon/Postgres connection string to serve data from the DB instead.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# ── Rate limiter (in-memory, per-IP) ─────────────────────────────────────────
+# R2 object storage: leave all empty to load artifacts from local models/ dir.
+# Set all four to download pkl artifacts from Cloudflare R2 at startup instead.
+R2_ENDPOINT_URL     = os.environ.get("R2_ENDPOINT_URL", "")
+R2_ACCESS_KEY_ID    = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET           = os.environ.get("R2_BUCKET", "")
+
+# Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
-# ── API-key auth (optional) ──────────────────────────────────────────────────
+# API-key auth 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def require_api_key(key: str = Depends(_api_key_header)):
@@ -38,7 +46,7 @@ async def require_api_key(key: str = Depends(_api_key_header)):
     if API_KEY and key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# ── Globals (populated in lifespan) ──────────────────────────────────────────
+# Globals 
 pipeline = None
 input_X = None
 cosine_sim1 = None
@@ -46,8 +54,8 @@ cosine_sim2 = None
 cosine_sim3 = None
 location_df = None
 property_names: List[str] = []
-viz_df = None       # analytics data – loaded from DB when DATABASE_URL is set
-db_engine = None    # SQLAlchemy engine, reused across requests
+viz_df = None       
+db_engine = None    
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -57,28 +65,42 @@ async def lifespan(app: FastAPI):
     print(f"Loading models from: {MODELS_DIR}")
 
     try:
-        # ── ML artifacts: always loaded from pkl files ────────────────────────
-        # These stay in the image until Phase 3 (Cloudflare R2) moves them out.
-        with open(os.path.join(MODELS_DIR, "final_xgb_pipeline.pkl"), "rb") as f:
-            pipeline = pickle.load(f)
+        # ── ML artifacts: download from R2 when configured, else read locally ──
+        # All four R2_* vars must be set to enable R2. Missing any one falls back
+        # to the local models/ directory, so misconfiguration can't break startup.
+        if R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET:
+            import boto3
+            _s3 = boto3.client(
+                "s3",
+                endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                region_name="auto",
+            )
+            def _load(key: str):
+                obj = _s3.get_object(Bucket=R2_BUCKET, Key=key)
+                return pickle.load(io.BytesIO(obj["Body"].read()))
+            print(f"Loading artifacts from R2 bucket '{R2_BUCKET}'")
+        else:
+            def _load(key: str):
+                with open(os.path.join(MODELS_DIR, key), "rb") as f:
+                    return pickle.load(f)
+            print(f"Loading artifacts from local directory: {MODELS_DIR}")
 
-        with open(os.path.join(MODELS_DIR, "cosine_sim1.pkl"), "rb") as f:
-            cosine_sim1 = pickle.load(f)
-        with open(os.path.join(MODELS_DIR, "cosine_sim2.pkl"), "rb") as f:
-            cosine_sim2 = pickle.load(f)
-        with open(os.path.join(MODELS_DIR, "cosine_sim3.pkl"), "rb") as f:
-            cosine_sim3 = pickle.load(f)
-        with open(os.path.join(MODELS_DIR, "location_distance.pkl"), "rb") as f:
-            location_df = pickle.load(f)
+        pipeline    = _load("final_xgb_pipeline.pkl")
+        cosine_sim1 = _load("cosine_sim1.pkl")
+        cosine_sim2 = _load("cosine_sim2.pkl")
+        cosine_sim3 = _load("cosine_sim3.pkl")
+        location_df = _load("location_distance.pkl")
 
         if not (cosine_sim1.shape == cosine_sim2.shape == cosine_sim3.shape ==
                 (len(location_df.index), len(location_df.index))):
             raise RuntimeError("Cosine matrices and location_df index size must match.")
 
         property_names = location_df.index.tolist()
-        print(f"✅ Loaded {len(property_names)} properties from pkl")
+        print(f"Loaded {len(property_names)} properties")
 
-        # ── Property data: Postgres when DATABASE_URL is set, pkl otherwise ──
+        # Property data: Postgres when DATABASE_URL is set, pkl otherwise 
         if DATABASE_URL:
             from sqlalchemy import create_engine as _create_engine
             # pool_pre_ping keeps connections alive on Neon's serverless backend
@@ -90,15 +112,15 @@ async def lifespan(app: FastAPI):
             )
             input_X = pd.read_sql("SELECT * FROM property_features", db_engine)
             viz_df = pd.read_sql("SELECT * FROM properties_viz", db_engine)
-            print(f"✅ Loaded {len(input_X)} feature rows and {len(viz_df)} viz rows from PostgreSQL")
+            print(f"Loaded {len(input_X)} feature rows and {len(viz_df)} viz rows from PostgreSQL")
         else:
             with open(os.path.join(MODELS_DIR, "input_data_X.pkl"), "rb") as f:
                 input_X = pickle.load(f)
-            print("✅ Loaded input features from local pkl (DATABASE_URL not set)")
+            print("Loaded input features from local pkl (DATABASE_URL not set)")
 
-        print("✅ Startup complete")
+        print(" Startup complete")
     except Exception as e:
-        print(f"❌ Startup failed: {e}")
+        print(f" Startup failed: {e}")
         raise
 
     yield
@@ -107,7 +129,7 @@ async def lifespan(app: FastAPI):
     if db_engine:
         db_engine.dispose()
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# App 
 app = FastAPI(title="Real Estate API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -119,7 +141,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# Schemas 
 class PriceRequest(BaseModel):
     property_type: str
     sector: str
@@ -166,7 +188,7 @@ class LocationSearchResponse(BaseModel):
     items: List[LocationSearchItem]
     count: int
 
-# ── Open endpoints (no auth required) ────────────────────────────────────────
+# Open endpoints 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -185,7 +207,7 @@ def root():
         }
     }
 
-# ── Protected – cheap data lookups ───────────────────────────────────────────
+# Protected 
 @app.get("/properties", dependencies=[Depends(require_api_key)])
 def get_properties():
     if property_names:
@@ -226,14 +248,9 @@ def get_locations():
         return {"locations": locations, "count": len(locations)}
     return {"locations": [], "count": 0}
 
-# ── Analytics data (served from DB when available) ────────────────────────────
+# Analytics data 
 @app.get("/analytics/data", dependencies=[Depends(require_api_key)])
 def get_analytics_data():
-    """
-    Returns the full visualization dataset for the analytics dashboard.
-    Only available when DATABASE_URL is configured; returns 503 otherwise
-    so the frontend gracefully falls back to its bundled CSV.
-    """
     if viz_df is None:
         raise HTTPException(
             status_code=503,
@@ -243,7 +260,7 @@ def get_analytics_data():
     # the bare NaN literal that Python's json module would produce.
     return JSONResponse(content=json.loads(viz_df.to_json(orient="records")))
 
-# ── Protected – compute endpoints (auth + rate limits) ───────────────────────
+# Protected – compute endpoints (auth + rate limits) 
 @app.post("/predict-price", response_model=PriceResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit("10/minute")
 def predict_price(request: Request, req: PriceRequest):
